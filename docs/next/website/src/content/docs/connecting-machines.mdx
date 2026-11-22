@@ -49,6 +49,18 @@ herdr machine add workbox --remote-session agents
 
 Without `--label`, this machine shows as `workbox/agents`. If the default name is already taken, `machine add` asks you to pass `--label`.
 
+### A machine for one session
+
+A saved machine shows in every local session by default. To show it in one local session only, add `--scope session`:
+
+```bash
+herdr --session agents machine add workbox --remote-session agents --scope session
+```
+
+Only the local `agents` session shows and connects to this machine; other local sessions do not. Run it from inside a session's pane to use that session without `--session`. To pair another local session with a different remote session on the same host, add a machine from that session too. `machine list` shows each machine's scope: `global`, or `session:<name>` for the current session's own machines.
+
+Machines for one session are saved in a separate file per session, so Herdr clients without this option keep reading the shared catalog and simply do not show them.
+
 On Windows servers, setup also checks executables used by Herdr processes owned by the SSH user. It validates their capabilities before reuse, so a compatible running build can be used even when SSH's `PATH` points to an older installation.
 
 Herdr checks both the installed binary and the running server. It starts the requested background server before saving the profile. Compatible client and server versions do not have to match. Missing or incompatible installations go through an approval-based setup. When the running server needs replacement, setup asks before stopping it and its pane processes, then starts the compatible server. The default answer is No. If installation and replacement are both needed, one confirmation covers them. `machine add` does not use experimental live handoff. Cancelling or failing setup leaves the profile unsaved.

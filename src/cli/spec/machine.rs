@@ -37,7 +37,10 @@ pub(super) fn command() -> Command {
                 .arg(
                     option("remote-session", "NAME")
                         .help("Select a session explicitly (default without an interactive terminal)"),
-                ),
+                )
+                .arg(option("scope", "global|session").help(
+                    "Show the machine in every local session (global, the default) or only in the current one (session)",
+                )),
         )
         .subcommand(
             profile_command("rename", "Rename a saved SSH machine").arg(

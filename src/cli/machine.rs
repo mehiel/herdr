@@ -11,7 +11,7 @@ const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine status [<label-or-id>] [--json]
   herdr machine reconnect <label-or-id>
-  herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]
+  herdr machine add <ssh-target> [--label <label>] [--remote-session <name>] [--scope global|session]
   herdr machine rename <profile-id> --label <label>
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
@@ -21,6 +21,8 @@ Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
+--scope session saves the machine for the current local session only (HERDR_SESSION, or --session);
+other local sessions do not show or connect to it. The default, global, shows it in every session.
 Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
 SSH credentials and key material remain owned by OpenSSH.";
 
@@ -32,6 +34,7 @@ struct MachineListRow<'a> {
     session: &'a str,
     enabled: bool,
     selected: bool,
+    scope: String,
 }
 
 pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
@@ -75,6 +78,7 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             session: &profile.session,
             enabled: profile.enabled,
             selected: catalog.selected_profile.as_ref() == Some(&profile.id),
+            scope: profile.scope_label(),
         })
         .collect::<Vec<_>>();
     if json {
@@ -91,8 +95,8 @@ fn list(args: &[String]) -> std::io::Result<i32> {
     for row in rows {
         let state = if row.enabled { "enabled" } else { "disabled" };
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            row.id, row.label, row.target, row.session, state
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            row.id, row.label, row.target, row.session, state, row.scope
         );
     }
     Ok(0)
@@ -212,17 +216,19 @@ struct AddArgs {
     target: String,
     label: Option<String>,
     session: Option<String>,
+    session_scope: bool,
 }
 
 fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
-    let args = super::expand_equals_args(args, &["--label", "--remote-session"]);
+    let args = super::expand_equals_args(args, &["--label", "--remote-session", "--scope"]);
     let mut target = None;
     let mut label = None;
     let mut session = None;
+    let mut scope = None;
     let mut index = 0;
     while index < args.len() {
         let (name, value) = match args[index].as_str() {
-            "--label" | "--remote-session" => {
+            "--label" | "--remote-session" | "--scope" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(format!("missing value for {}", args[index]));
                 };
@@ -247,17 +253,26 @@ fn parse_add_args(args: &[String]) -> Result<AddArgs, String> {
             "--label" => {
                 return Err("--label can only be specified once".into());
             }
+            "--scope" if scope.is_some() => {
+                return Err("--scope can only be specified once".into());
+            }
+            "--scope" => match value.as_str() {
+                "global" => scope = Some(false),
+                "session" => scope = Some(true),
+                other => return Err(format!("--scope must be global or session, not {other}")),
+            },
             _ => unreachable!("validated machine add option"),
         }
     }
     let target = target.ok_or_else(|| {
-        "usage: herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]"
+        "usage: herdr machine add <ssh-target> [--label <label>] [--remote-session <name>] [--scope global|session]"
             .to_owned()
     })?;
     Ok(AddArgs {
         target,
         label,
         session,
+        session_scope: scope.unwrap_or(false),
     })
 }
 
@@ -301,6 +316,7 @@ fn add(args: &[String]) -> std::io::Result<i32> {
         target,
         label,
         session,
+        session_scope,
     } = match parse_add_args(args) {
         Ok(args) => args,
         Err(error) => {
@@ -338,7 +354,9 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     }
-    match catalog.add_ssh(label.clone(), &target, session.clone()) {
+    let local_session =
+        session_scope.then(crate::client::endpoint::local_session_name);
+    match catalog.add_ssh_scoped(label.clone(), &target, session.clone(), local_session.clone()) {
         Ok(_) => {}
         Err(error) => {
             eprintln!("error: {error}");
@@ -369,7 +387,7 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     }
-    let id = match catalog.add_ssh(label, &target, &session) {
+    let id = match catalog.add_ssh_scoped(label, &target, &session, local_session.clone()) {
         Ok(id) => id,
         Err(error) => {
             eprintln!("error: {error}");
@@ -385,7 +403,10 @@ fn add(args: &[String]) -> std::io::Result<i32> {
         crate::client::endpoint::SshMetadataCache::new(id.as_str(), &target, &session)?
             .store(&metadata);
     }
-    println!("Saved SSH machine {id}. Remote server is ready.");
+    match &local_session {
+        Some(name) => println!("Saved SSH machine {id} for local session {name}. Remote server is ready."),
+        None => println!("Saved SSH machine {id}. Remote server is ready."),
+    }
     println!("Open Herdr clients connect automatically.");
     Ok(0)
 }
@@ -614,10 +635,26 @@ mod tests {
                     target: "workstation.coder".into(),
                     label: Some("coder".into()),
                     session: session.map(str::to_owned),
+                    session_scope: false,
                 },
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn add_parser_reads_the_scope() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["xps".to_owned()];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            parse_add_args(&args)
+        };
+        assert!(!parse(&[]).unwrap().session_scope);
+        assert!(!parse(&["--scope", "global"]).unwrap().session_scope);
+        assert!(parse(&["--scope", "session"]).unwrap().session_scope);
+        assert!(parse(&["--scope=session"]).unwrap().session_scope);
+        assert!(parse(&["--scope", "machine"]).is_err());
+        assert!(parse(&["--scope", "session", "--scope", "global"]).is_err());
     }
 
     #[test]
@@ -697,6 +734,7 @@ mod tests {
             session: "agents",
             enabled: true,
             selected: false,
+            scope: "global".into(),
         })
         .unwrap();
         assert!(!encoded.contains("password"));

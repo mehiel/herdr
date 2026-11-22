@@ -23,6 +23,10 @@ pub(crate) struct SavedSshEndpoint {
     pub(crate) target: String,
     pub(crate) session: String,
     pub(crate) enabled: bool,
+    /// The local session this machine belongs to, or `None` for every session. Never written into a
+    /// catalog file: a machine for one session lives in that session's own catalog file.
+    #[serde(skip)]
+    pub(crate) local_session: Option<String>,
 }
 
 impl SavedSshEndpoint {
@@ -37,6 +41,7 @@ impl SavedSshEndpoint {
             target: target.into(),
             session: session.into(),
             enabled: true,
+            local_session: None,
         };
         profile.validate()?;
         Ok(profile)
@@ -67,7 +72,18 @@ impl SavedSshEndpoint {
             return Err("SSH target must not contain a password".into());
         }
         crate::session::validate_name(&self.session)?;
+        if let Some(local_session) = &self.local_session {
+            crate::session::validate_name(local_session)?;
+        }
         Ok(())
+    }
+
+    /// `global`, or `session:<name>` for a machine that only the named local session shows.
+    pub(crate) fn scope_label(&self) -> String {
+        match &self.local_session {
+            Some(name) => format!("session:{name}"),
+            None => "global".to_owned(),
+        }
     }
 }
 
@@ -79,6 +95,9 @@ pub(crate) struct EndpointCatalog {
     pub(crate) selected_profile: Option<ProfileId>,
     #[serde(default)]
     pub(crate) ssh: Vec<SavedSshEndpoint>,
+    /// The local session whose catalog file was loaded alongside the shared one.
+    #[serde(skip)]
+    loaded_session: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,22 +113,49 @@ impl Default for EndpointCatalog {
             version: CATALOG_VERSION,
             selected_profile: None,
             ssh: Vec::new(),
+            loaded_session: None,
         }
     }
 }
 
 impl EndpointCatalog {
     pub(crate) fn load() -> Result<Self, String> {
-        Self::load_from_paths(&catalog_path(), &selection_path())
+        let session = local_session_name();
+        Self::load_from_paths(
+            &catalog_path(),
+            &session_catalog_path(&session),
+            &session,
+            &selection_path(),
+        )
     }
 
     pub(crate) fn load_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
         // Live clients keep their own selection, independent of other attached clients.
-        Self::load_from_path(&catalog_path()).map(|catalog| catalog.ssh)
+        let session = local_session_name();
+        Self::load_merged(&catalog_path(), &session_catalog_path(&session), &session)
+            .map(|catalog| catalog.ssh)
     }
 
-    fn load_from_paths(catalog_path: &Path, selection_path: &Path) -> Result<Self, String> {
-        let mut catalog = Self::load_from_path(catalog_path)?;
+    /// The machines every session shows, followed by the ones saved for `session` only.
+    fn load_merged(global_path: &Path, session_path: &Path, session: &str) -> Result<Self, String> {
+        let mut catalog = Self::load_from_path(global_path)?;
+        let scoped = Self::load_from_path(session_path)?;
+        for mut profile in scoped.ssh {
+            profile.local_session = Some(session.to_owned());
+            catalog.ssh.push(profile);
+        }
+        catalog.loaded_session = Some(session.to_owned());
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    fn load_from_paths(
+        catalog_path: &Path,
+        session_path: &Path,
+        session: &str,
+        selection_path: &Path,
+    ) -> Result<Self, String> {
+        let mut catalog = Self::load_merged(catalog_path, session_path, session)?;
         match load_selection_from_path(selection_path) {
             Ok(Some(selection)) => {
                 let valid = selection.selected_profile.as_ref().is_none_or(|selected| {
@@ -140,7 +186,59 @@ impl EndpointCatalog {
     }
 
     pub(crate) fn store_profiles(&self) -> Result<(), String> {
-        self.store_to_path(&catalog_path())
+        self.store_to_paths(&catalog_path(), &|name| session_catalog_path(name))
+    }
+
+    /// Writes the global machines to the shared catalog, and each session's machines to that
+    /// session's catalog, so clients that predate session machines read the shared file unchanged.
+    fn store_to_paths(
+        &self,
+        global_path: &Path,
+        session_path: &dyn Fn(&str) -> PathBuf,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let mut sessions: Vec<&str> = Vec::new();
+        for profile in &self.ssh {
+            if let Some(name) = profile.local_session.as_deref() {
+                if !sessions.contains(&name) {
+                    sessions.push(name);
+                }
+            }
+        }
+        let current = self.loaded_session.clone().unwrap_or_else(local_session_name);
+        if !sessions.contains(&current.as_str()) {
+            // Removing the last machine of this session must empty its file.
+            sessions.push(&current);
+        }
+        for name in sessions {
+            let path = session_path(name);
+            let part = self.part(Some(name));
+            if part.ssh.is_empty() && !path.exists() {
+                continue;
+            }
+            part.store_to_path(&path)?;
+        }
+        self.part(None).store_to_path(global_path)
+    }
+
+    /// The machines of one scope as a catalog of their own; only the global part keeps the selection.
+    fn part(&self, local_session: Option<&str>) -> Self {
+        let ssh: Vec<SavedSshEndpoint> = self
+            .ssh
+            .iter()
+            .filter(|profile| profile.local_session.as_deref() == local_session)
+            .cloned()
+            .collect();
+        let selected_profile = self
+            .selected_profile
+            .clone()
+            .filter(|selected| local_session.is_none() && ssh.iter().any(|profile| &profile.id == selected));
+        Self {
+            version: CATALOG_VERSION,
+            selected_profile,
+            ssh,
+            loaded_session: None,
+        }
     }
 
     pub(crate) fn store_selection(&self) -> Result<(), String> {
@@ -157,16 +255,35 @@ impl EndpointCatalog {
         store_private_json(path, &content, "endpoint selection")
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn add_ssh(
         &mut self,
         label: impl Into<String>,
         target: impl Into<String>,
         session: impl Into<String>,
     ) -> Result<ProfileId, String> {
-        if self.ssh.len() >= MAX_PROFILES {
+        self.add_ssh_scoped(label, target, session, None)
+    }
+
+    /// Saves a machine for every local session (`None`) or for the named local session only.
+    pub(crate) fn add_ssh_scoped(
+        &mut self,
+        label: impl Into<String>,
+        target: impl Into<String>,
+        session: impl Into<String>,
+        local_session: Option<String>,
+    ) -> Result<ProfileId, String> {
+        let in_scope = self
+            .ssh
+            .iter()
+            .filter(|profile| profile.local_session == local_session)
+            .count();
+        if in_scope >= MAX_PROFILES {
             return Err(format!("at most {MAX_PROFILES} SSH endpoints can be saved"));
         }
-        let profile = SavedSshEndpoint::new(label, target, session)?;
+        let mut profile = SavedSshEndpoint::new(label, target, session)?;
+        profile.local_session = local_session;
+        profile.validate()?;
         let id = profile.id.clone();
         self.ssh.push(profile);
         Ok(id)
@@ -250,7 +367,8 @@ impl EndpointCatalog {
                 self.version
             ));
         }
-        if self.ssh.len() > MAX_PROFILES {
+        let global = self.ssh.iter().filter(|profile| profile.local_session.is_none()).count();
+        if global > MAX_PROFILES || self.ssh.len() - global > MAX_PROFILES {
             return Err(format!(
                 "endpoint catalog contains more than {MAX_PROFILES} SSH profiles"
             ));
@@ -376,6 +494,20 @@ pub(crate) fn catalog_path() -> PathBuf {
         .join("endpoints.json")
 }
 
+/// The catalog of machines saved for one local session only.
+pub(crate) fn session_catalog_path(session: &str) -> PathBuf {
+    crate::config::state_dir()
+        .join("client")
+        .join("sessions")
+        .join(session)
+        .join("endpoints.json")
+}
+
+/// The local session this process belongs to (`HERDR_SESSION`, else the default session).
+pub(crate) fn local_session_name() -> String {
+    crate::session::active_name().unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned())
+}
+
 fn selection_path() -> PathBuf {
     crate::config::state_dir()
         .join("client")
@@ -414,6 +546,88 @@ mod tests {
         assert_eq!(loaded, catalog);
         assert_eq!(loaded.ssh[0].id, id);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_machines_live_in_their_own_file_and_load_only_for_their_session() {
+        let global = path("session-scope");
+        let dir = global.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        let session_file = |name: &str| dir.join("sessions").join(name).join("endpoints.json");
+
+        let mut catalog = EndpointCatalog::default();
+        let shared = catalog.add_ssh("Build", "build", "agents").unwrap();
+        let scoped = catalog
+            .add_ssh_scoped("xps", "xps", "factory", Some("factory".into()))
+            .unwrap();
+        catalog.store_to_paths(&global, &session_file).unwrap();
+
+        // The shared file keeps the format older clients read: no scoped machine, no new field.
+        let encoded = std::fs::read_to_string(&global).unwrap();
+        assert!(!encoded.contains("factory"), "{encoded}");
+        assert!(!encoded.contains("local_session"), "{encoded}");
+        let older = EndpointCatalog::load_from_path(&global).unwrap();
+        assert_eq!(older.ssh.len(), 1);
+        assert_eq!(older.ssh[0].id, shared);
+
+        let factory =
+            EndpointCatalog::load_merged(&global, &session_file("factory"), "factory").unwrap();
+        assert_eq!(factory.ssh.len(), 2);
+        assert_eq!(factory.ssh[1].id, scoped);
+        assert_eq!(factory.ssh[1].local_session.as_deref(), Some("factory"));
+        assert_eq!(factory.ssh[1].scope_label(), "session:factory");
+        assert_eq!(factory.ssh[0].scope_label(), "global");
+
+        let horizon =
+            EndpointCatalog::load_merged(&global, &session_file("horizon"), "horizon").unwrap();
+        assert_eq!(horizon.ssh.len(), 1);
+        assert_eq!(horizon.ssh[0].id, shared);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn removing_a_session_machine_rewrites_only_that_session_file() {
+        let global = path("session-remove");
+        let dir = global.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        let session_file = |name: &str| dir.join("sessions").join(name).join("endpoints.json");
+
+        let mut catalog = EndpointCatalog::default();
+        catalog.add_ssh("Build", "build", "agents").unwrap();
+        let scoped = catalog
+            .add_ssh_scoped("xps", "xps", "horizon", Some("horizon".into()))
+            .unwrap();
+        catalog.store_to_paths(&global, &session_file).unwrap();
+        let before = std::fs::read(&global).unwrap();
+
+        let mut loaded =
+            EndpointCatalog::load_merged(&global, &session_file("horizon"), "horizon").unwrap();
+        assert!(loaded.remove_ssh(&scoped));
+        loaded.store_to_paths(&global, &session_file).unwrap();
+        assert_eq!(std::fs::read(&global).unwrap(), before);
+        let reloaded =
+            EndpointCatalog::load_merged(&global, &session_file("horizon"), "horizon").unwrap();
+        assert_eq!(reloaded.ssh.len(), 1);
+        assert_eq!(reloaded.ssh[0].local_session, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_selected_session_machine_is_not_written_into_the_shared_file() {
+        let global = path("session-select");
+        let dir = global.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        let session_file = |name: &str| dir.join("sessions").join(name).join("endpoints.json");
+
+        let mut catalog = EndpointCatalog::default();
+        let scoped = catalog
+            .add_ssh_scoped("xps", "xps", "factory", Some("factory".into()))
+            .unwrap();
+        assert!(catalog.select_ssh(&scoped));
+        catalog.store_to_paths(&global, &session_file).unwrap();
+        // An older client must still be able to read the shared file.
+        assert_eq!(EndpointCatalog::load_from_path(&global).unwrap().selected_profile, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -538,7 +752,13 @@ mod tests {
         catalog.store_to_path(&catalog_path).unwrap();
         std::fs::write(&selection_path, b"not json").unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &catalog_path.with_file_name("session.json"),
+            "default",
+            &selection_path,
+        )
+        .unwrap();
         assert_eq!(loaded.ssh.len(), 1);
         assert_eq!(loaded.ssh[0].id, id);
         assert_eq!(loaded.selected_profile, None);
@@ -565,7 +785,13 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &catalog_path.with_file_name("session.json"),
+            "default",
+            &selection_path,
+        )
+        .unwrap();
         assert_eq!(loaded.ssh[0].id, saved);
         assert_eq!(loaded.selected_profile, None);
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
